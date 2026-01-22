@@ -3,9 +3,9 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import streamlit as st
 
@@ -15,16 +15,22 @@ try:
 except Exception:
     genai = None
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # py<3.9
+
+TZ_NAME = "America/New_York"
 
 # -----------------------------
-# Storage (local file). Works on Streamlit Cloud too.
+# Storage
 # -----------------------------
-APP_DIR = Path(".")  # keep inside app folder for Streamlit Cloud
-DATA_PATH = APP_DIR / "tasks.json"
+APP_DIR = Path(".")
+TASKS_PATH = APP_DIR / "tasks.json"
+PLAN_PATH = APP_DIR / "today_plan.json"
 
 CATEGORIES = ["Money", "Family", "Nova", "School", "Health", "Admin", "Career", "Other"]
 BUCKETS = ["Do now", "Stabilize", "Plan next", "Park"]
-STATUS = ["Open", "Done"]
 
 
 @dataclass
@@ -38,67 +44,88 @@ class Task:
     blocked: bool
     next_step: str
     bucket: str
-    status: str
-    created_at: str
+    status: str              # Open/Done
+    created_at: str          # ISO datetime
+
+
+def tz_now() -> datetime:
+    if ZoneInfo is None:
+        return datetime.now()
+    return datetime.now(ZoneInfo(TZ_NAME))
+
+
+def today_est() -> date:
+    return tz_now().date()
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return tz_now().isoformat(timespec="seconds")
 
 
 def ensure_storage() -> None:
-    if not DATA_PATH.exists():
-        DATA_PATH.write_text(json.dumps({"tasks": []}, indent=2), encoding="utf-8")
+    if not TASKS_PATH.exists():
+        TASKS_PATH.write_text(json.dumps({"tasks": []}, indent=2), encoding="utf-8")
 
 
 def load_tasks() -> List[Task]:
     ensure_storage()
-    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    data = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
     return [Task(**t) for t in data.get("tasks", [])]
 
 
 def save_tasks(tasks: List[Task]) -> None:
-    DATA_PATH.write_text(json.dumps({"tasks": [asdict(t) for t in tasks]}, indent=2), encoding="utf-8")
+    TASKS_PATH.write_text(json.dumps({"tasks": [asdict(t) for t in tasks]}, indent=2), encoding="utf-8")
+
+
+def load_plan() -> Optional[Dict[str, Any]]:
+    if not PLAN_PATH.exists():
+        return None
+    try:
+        return json.loads(PLAN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_plan(plan: Dict[str, Any]) -> None:
+    PLAN_PATH.write_text(json.dumps(plan, indent=2), encoding="utf-8")
 
 
 # -----------------------------
-# Basic parsing (fallback if no Gemini)
+# Parsing + defaults (fallback)
 # -----------------------------
 def parse_due_date(text: str) -> Optional[str]:
     t = text.strip().lower()
-    today = date.today()
+    td = today_est()
 
     if "today" in t:
-        return today.isoformat()
+        return td.isoformat()
     if "tomorrow" in t:
-        return (today + timedelta(days=1)).isoformat()
+        return (td + timedelta(days=1)).isoformat()
 
     m = re.search(r"in\s+(\d{1,2})\s+days?", t)
     if m:
-        return (today + timedelta(days=int(m.group(1)))).isoformat()
+        return (td + timedelta(days=int(m.group(1)))).isoformat()
 
     m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", t)
     if m:
         return m.group(1)
 
-    # "Jan 29" or "due Jan 29"
     month = {
         "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
         "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
-        "nov": 11, "november": 11, "dec": 12, "december": 12
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12
     }
     m = re.search(r"\b(?:due\s+)?([a-z]{3,9})\s+(\d{1,2})(?:\b|,)\s*(\d{4})?\b", t)
     if m:
         mon = month.get(m.group(1))
         day = int(m.group(2))
-        yr = int(m.group(3)) if m.group(3) else today.year
+        yr = int(m.group(3)) if m.group(3) else td.year
         if mon:
             try:
                 return date(yr, mon, day).isoformat()
             except Exception:
                 return None
-
     return None
 
 
@@ -120,14 +147,12 @@ def guess_category(text: str) -> str:
 
 
 def default_urgency(category: str, due: Optional[str], text: str) -> int:
-    # Base urgency by category
     base = {"Money": 5, "Nova": 5, "Family": 4, "School": 4, "Health": 3, "Admin": 3, "Career": 3, "Other": 2}.get(category, 2)
 
-    # If due date is soon, bump
     if due:
         try:
             d = date.fromisoformat(due)
-            days = (d - date.today()).days
+            days = (d - today_est()).days
             if days <= 0:
                 return 5
             if days <= 3:
@@ -137,7 +162,6 @@ def default_urgency(category: str, due: Optional[str], text: str) -> int:
         except Exception:
             pass
 
-    # If contains "asap" or "urgent"
     if re.search(r"\basap\b|\burgent\b|\bdue\b", text.lower()):
         return min(5, max(base, 4))
 
@@ -146,10 +170,10 @@ def default_urgency(category: str, due: Optional[str], text: str) -> int:
 
 def default_blocked(category: str, text: str) -> bool:
     t = text.lower()
-    # money debts often not solvable instantly -> treat as "blocked" unless it's a direct bill with due date
+    # Debts and "pay back" often need timing -> stabilize
     if category == "Money" and any(k in t for k in ["owe", "pay back", "payback", "need to give", "need to pay"]):
         return True
-    # family overwhelm -> not "blocked" but we want "container" actions, which behave like stabilize
+    # Mom overwhelm -> stabilize with container action
     if category == "Family" and any(k in t for k in ["mom", "mother"]):
         return True
     return False
@@ -157,27 +181,20 @@ def default_blocked(category: str, text: str) -> bool:
 
 def next_step_template(category: str, text: str) -> str:
     t = text.lower()
-
     if category == "Money":
         if any(k in t for k in ["rent", "utilities", "bill", "due"]):
-            return "Send one message/call to confirm payment timing or ask for a short extension (10 min)."
-        return "Text the person: propose a date + partial payment if possible (10 min)."
-
+            return "Send one message/call: confirm payment timing or ask for short extension (10 min)."
+        return "Text the person: propose exact date + partial payment if possible (10 min)."
     if category == "Family":
-        # container action
         return "Send boundary message: set 2 fixed call times this week, 20 min each (10 min)."
-
     if category == "Nova":
-        return "2-min start: open the doc/list, write the first ugly outline. Then 45-min focused sprint."
-
+        return "2-min start: open the doc/list and outline. Then 45-min focused sprint."
     if category == "School":
-        return "Write the next 3 micro-steps and do the first 15 minutes immediately."
-
+        return "Write the next 3 micro-steps and do the first 15 minutes now."
     return "Write the smallest 15-min next action and do it now."
 
 
 def bucket_rule(category: str, urgency: int, blocked: bool) -> str:
-    # Simple + practical: urgent + actionable -> Do now, urgent + blocked -> Stabilize
     if urgency >= 4:
         return "Stabilize" if blocked else "Do now"
     if urgency == 3:
@@ -186,10 +203,9 @@ def bucket_rule(category: str, urgency: int, blocked: bool) -> str:
 
 
 # -----------------------------
-# Gemini integration (optional)
+# Gemini (optional)
 # -----------------------------
 def get_api_key() -> Optional[str]:
-    # Streamlit Cloud: use secrets
     key = None
     if "GEMINI_API_KEY" in st.secrets:
         key = str(st.secrets["GEMINI_API_KEY"]).strip()
@@ -203,98 +219,221 @@ def gemini_available() -> bool:
 
 
 def gemini_triage(lines: List[str], model: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    Returns a list of dicts:
-    {title, category, due_date, urgency, blocked, next_step}
-    """
     if not gemini_available():
         return None
 
     client = genai.Client(api_key=get_api_key())
-
     prompt = f"""
-You are a stress triage assistant. Turn each line into a structured task.
+Return ONLY valid JSON (no markdown), as an array of objects for each line.
 
-Return ONLY valid JSON (no markdown), as an array of objects.
-Each object must include:
+Fields per object:
 - title: short concrete title
 - category: one of {CATEGORIES}
 - due_date: "YYYY-MM-DD" or null
 - urgency: integer 1-5 (5 = very urgent)
-- blocked: boolean (true if not solvable now; then suggest stabilize step)
-- next_step: a specific action that fits in <= 15 minutes
+- blocked: boolean
+- next_step: <=15 minute action
 
 Lines:
 {json.dumps(lines, ensure_ascii=False)}
 """.strip()
 
     try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        # Try to parse JSON from response text
+        resp = client.models.generate_content(model=model, contents=prompt)
         text = resp.text.strip()
-        # Sometimes models include extra text; extract JSON array if needed
         start = text.find("[")
         end = text.rfind("]")
         if start != -1 and end != -1:
-            text = text[start : end + 1]
+            text = text[start:end + 1]
         data = json.loads(text)
-        if not isinstance(data, list):
-            return None
-        out = []
-        for obj in data:
-            if not isinstance(obj, dict):
-                continue
-            out.append(obj)
-        return out
+        return data if isinstance(data, list) else None
     except Exception:
         return None
 
 
 # -----------------------------
-# Streamlit UI (minimal)
+# Today plan snapshot (persisted)
+# -----------------------------
+def compute_ranked(tasks: List[Task]) -> List[Task]:
+    bucket_order = {"Do now": 0, "Stabilize": 1, "Plan next": 2, "Park": 3}
+    open_tasks = [t for t in tasks if t.status == "Open"]
+    open_tasks.sort(key=lambda t: (bucket_order.get(t.bucket, 9), -t.urgency, t.created_at))
+    return open_tasks
+
+
+def generate_today_plan(tasks: List[Task]) -> Dict[str, Any]:
+    ranked = compute_ranked(tasks)
+    # Snapshot: store the ordered ids + minimal display fields
+    plan = {
+        "date": today_est().isoformat(),
+        "ordered_ids": [t.id for t in ranked],
+        "generated_at": now_iso(),
+    }
+    return plan
+
+
+def get_or_create_today_plan(tasks: List[Task], force: bool = False) -> Dict[str, Any]:
+    plan = load_plan()
+    if force or (plan is None) or (plan.get("date") != today_est().isoformat()):
+        plan = generate_today_plan(tasks)
+        save_plan(plan)
+    return plan
+
+
+# -----------------------------
+# Calendar scheduling + CSV export
+# -----------------------------
+def availability_blocks(start_day: date, days_ahead: int = 14) -> List[Tuple[datetime, datetime]]:
+    """
+    Returns available work blocks in EST for the next days_ahead days, based on:
+    Mon-Fri: 19:00-21:00
+    Sat: 14:00-17:00
+    Sun: 19:00-21:00
+    """
+    tz = ZoneInfo(TZ_NAME) if ZoneInfo else None
+    blocks = []
+    for i in range(days_ahead):
+        d = start_day + timedelta(days=i)
+        dow = d.weekday()  # Mon=0 .. Sun=6
+
+        if dow in [0, 1, 2, 3, 4]:  # Mon-Fri
+            s, e = time(19, 0), time(21, 0)
+        elif dow == 5:  # Sat
+            s, e = time(14, 0), time(17, 0)
+        else:  # Sun
+            s, e = time(19, 0), time(21, 0)
+
+        start_dt = datetime.combine(d, s)
+        end_dt = datetime.combine(d, e)
+        if tz:
+            start_dt = start_dt.replace(tzinfo=tz)
+            end_dt = end_dt.replace(tzinfo=tz)
+
+        # If today, don't schedule in the past
+        now_dt = tz_now()
+        if start_dt < now_dt < end_dt:
+            start_dt = now_dt.replace(second=0, microsecond=0)
+
+        if end_dt > start_dt:
+            blocks.append((start_dt, end_dt))
+    return blocks
+
+
+def default_duration_minutes(task: Task) -> int:
+    # Keep it simple and realistic
+    if task.bucket == "Do now":
+        return 60
+    if task.bucket == "Stabilize":
+        return 30
+    if task.bucket == "Plan next":
+        return 30
+    return 0
+
+
+def schedule_into_blocks(tasks_in_order: List[Task], blocks: List[Tuple[datetime, datetime]]) -> List[Dict[str, Any]]:
+    """
+    Creates event segments inside blocks.
+    Splits tasks if needed.
+    """
+    events = []
+    block_i = 0
+    cursor = blocks[0][0] if blocks else None
+
+    def advance_block():
+        nonlocal block_i, cursor
+        block_i += 1
+        if block_i >= len(blocks):
+            cursor = None
+            return
+        cursor = blocks[block_i][0]
+
+    for t in tasks_in_order:
+        mins = default_duration_minutes(t)
+        if mins <= 0:
+            continue
+
+        remaining = mins
+        part = 1
+
+        while remaining > 0 and cursor is not None:
+            block_start, block_end = blocks[block_i]
+            if cursor < block_start:
+                cursor = block_start
+
+            available = int((block_end - cursor).total_seconds() // 60)
+            if available <= 0:
+                advance_block()
+                continue
+
+            use = min(remaining, available)
+            start_dt = cursor
+            end_dt = cursor + timedelta(minutes=use)
+
+            title = f"{t.category}: {t.title}"
+            if mins > use:
+                title = f"{title} (part {part})"
+
+            events.append({
+                "Subject": title,
+                "Start Date": start_dt.strftime("%m/%d/%Y"),
+                "Start Time": start_dt.strftime("%I:%M %p"),
+                "End Date": end_dt.strftime("%m/%d/%Y"),
+                "End Time": end_dt.strftime("%I:%M %p"),
+                "All Day Event": "False",
+                "Description": f"Next step: {t.next_step}",
+                "Location": "",
+                "Private": "True",
+            })
+
+            cursor = end_dt
+            remaining -= use
+            part += 1
+
+            if cursor >= block_end:
+                advance_block()
+
+    return events
+
+
+# -----------------------------
+# UI
 # -----------------------------
 st.set_page_config(page_title="Stress Triage", layout="wide")
 st.title("Stress Triage")
-st.caption("Paste everything. Click triage. Get a clear plan.")
 
-tasks: List[Task] = load_tasks()
+tasks = load_tasks()
 
-col1, col2 = st.columns([2, 1])
-with col2:
-    panic_mode = st.toggle("Panic mode", value=True)
-    st.caption("Panic mode shows only the smallest plan.")
-    use_gemini = st.toggle("Use Gemini (auto)", value=True, disabled=not gemini_available())
-    model = st.selectbox("Model", ["gemini-2.0-flash", "gemini-2.5-flash"], index=0, disabled=not gemini_available())
-    if not gemini_available():
-        st.caption("Gemini off: set GEMINI_API_KEY in Streamlit secrets or env.")
+right = st.sidebar
+panic_mode = right.toggle("Panic mode (Top 3 only)", value=True)
 
-with col1:
-    st.subheader("Dump list")
-    dump = st.text_area(
-        "One per line",
-        height=160,
-        placeholder="Example:\n$1200 rent + utilities due Jan 29\nNeed to pay friend $1000 ASAP\nNova: finish 5 students applications\nCall mom (overwhelming)",
-    )
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        triage_btn = st.button("Triage + add", use_container_width=True)
-    with cB:
-        clear_btn = st.button("Clear input", use_container_width=True)
-    with cC:
-        reset_btn = st.button("Clear all saved tasks", use_container_width=True)
+use_gemini = right.toggle("Use Gemini", value=True, disabled=not gemini_available())
+model = right.selectbox("Model", ["gemini-2.0-flash", "gemini-2.5-flash"], index=0, disabled=not gemini_available())
 
-    if clear_btn:
-        st.rerun()
+right.divider()
+if right.button("Regenerate Today plan"):
+    get_or_create_today_plan(tasks, force=True)
+    st.success("Regenerated.")
+    st.rerun()
 
-    if reset_btn:
-        save_tasks([])
-        st.success("Cleared.")
-        st.rerun()
+if right.button("Clear all tasks"):
+    tasks = []
+    save_tasks(tasks)
+    if PLAN_PATH.exists():
+        PLAN_PATH.unlink()
+    st.success("Cleared.")
+    st.rerun()
 
-    if triage_btn:
+st.caption("Paste everything, one per line. We auto-triage and keep your Today plan saved across restarts.")
+
+dump = st.text_area(
+    "Dump list (one per line)",
+    height=140,
+    placeholder="Example:\n$1200 rent + utilities due Jan 29\nNeed to pay friend $1000 ASAP\nNova: finish 5 student applications\nCall mom (overwhelming)",
+)
+
+c1, c2 = st.columns([1, 1])
+with c1:
+    if st.button("Triage + add", use_container_width=True):
         lines = [ln.strip() for ln in dump.splitlines() if ln.strip()]
         if not lines:
             st.warning("Paste at least one line.")
@@ -302,7 +441,7 @@ with col1:
             ai = gemini_triage(lines, model=model) if (use_gemini and gemini_available()) else None
 
             for i, ln in enumerate(lines):
-                if ai and i < len(ai):
+                if ai and i < len(ai) and isinstance(ai[i], dict):
                     obj = ai[i]
                     title = str(obj.get("title") or ln).strip()
                     category = str(obj.get("category") or guess_category(ln)).strip()
@@ -324,112 +463,128 @@ with col1:
 
                 bucket = bucket_rule(category, urgency, blocked)
 
-                tasks.insert(
-                    0,
-                    Task(
-                        id=str(uuid.uuid4())[:8],
-                        raw=ln,
-                        title=title,
-                        category=category,
-                        due_date=due,
-                        urgency=urgency,
-                        blocked=blocked,
-                        next_step=next_step,
-                        bucket=bucket,
-                        status="Open",
-                        created_at=now_iso(),
-                    ),
-                )
+                tasks.insert(0, Task(
+                    id=str(uuid.uuid4())[:8],
+                    raw=ln,
+                    title=title,
+                    category=category,
+                    due_date=due,
+                    urgency=urgency,
+                    blocked=blocked,
+                    next_step=next_step,
+                    bucket=bucket,
+                    status="Open",
+                    created_at=now_iso(),
+                ))
 
             save_tasks(tasks)
-            st.success(f"Added {len(lines)} item(s). Go below for your plan.")
+
+            # Create/refresh plan only if none exists for today (keeps output stable)
+            get_or_create_today_plan(tasks, force=False)
+
+            st.success(f"Added {len(lines)} item(s).")
             st.rerun()
 
+with c2:
+    if st.button("Clear input", use_container_width=True):
+        st.rerun()
 
-# -----------------------------
-# Output
-# -----------------------------
-open_tasks = [t for t in tasks if t.status == "Open"]
+st.divider()
 
-# Sort: bucket first, urgency desc, created_at desc
-bucket_order = {"Do now": 0, "Stabilize": 1, "Plan next": 2, "Park": 3}
-open_tasks.sort(key=lambda t: (bucket_order.get(t.bucket, 9), -t.urgency, t.created_at), reverse=False)
+# Apply saved Today plan order
+plan = get_or_create_today_plan(tasks, force=False)
+id_to_task = {t.id: t for t in tasks}
+ordered = [id_to_task[tid] for tid in plan.get("ordered_ids", []) if tid in id_to_task and id_to_task[tid].status == "Open"]
 
-do_now = [t for t in open_tasks if t.bucket == "Do now"]
-stabilize = [t for t in open_tasks if t.bucket == "Stabilize"]
-plan_next = [t for t in open_tasks if t.bucket == "Plan next"]
-park = [t for t in open_tasks if t.bucket == "Park"]
+# If plan ids missing (new tasks etc), append remaining open tasks at end
+open_ids = {t.id for t in tasks if t.status == "Open"}
+planned_ids = {t.id for t in ordered}
+remaining = [t for t in compute_ranked(tasks) if t.id in open_ids and t.id not in planned_ids]
+ordered.extend(remaining)
 
-
-def render_task_row(t: Task):
+def render_task(t: Task):
     left, right = st.columns([6, 1])
     with left:
         due = f" | due {t.due_date}" if t.due_date else ""
-        st.write(f"**[{t.category}] {t.title}**  (urgency {t.urgency}/5{due})")
+        st.write(f"**[{t.bucket}] [{t.category}] {t.title}** (urgency {t.urgency}/5{due})")
         st.write(f"- {t.next_step}")
     with right:
         if st.button("Done", key=f"done_{t.id}"):
             t.status = "Done"
             save_tasks(tasks)
+            # keep plan file; it will naturally ignore done items
             st.rerun()
 
+# Output sections
+do_now = [t for t in ordered if t.bucket == "Do now"]
+stabilize = [t for t in ordered if t.bucket == "Stabilize"]
+plan_next = [t for t in ordered if t.bucket == "Plan next"]
+park = [t for t in ordered if t.bucket == "Park"]
+
+if panic_mode:
+    st.subheader("Today (Top 3)")
+    top3 = (do_now + stabilize + plan_next)[:3]
+    if not top3:
+        st.info("No open items.")
+    else:
+        for t in top3:
+            render_task(t)
+else:
+    st.subheader("Do now")
+    for t in do_now[:10]:
+        render_task(t)
+    st.subheader("Stabilize")
+    for t in stabilize[:10]:
+        render_task(t)
+    st.subheader("Plan next")
+    for t in plan_next[:15]:
+        render_task(t)
+    with st.expander("Park"):
+        for t in park[:25]:
+            render_task(t)
 
 st.divider()
 
-if panic_mode:
-    st.subheader("Today (Top 3 only)")
-    top = (do_now + stabilize + plan_next)[:3]
-    if not top:
-        st.info("No open items. Add lines above.")
-    else:
-        for t in top:
-            render_task_row(t)
+# Calendar CSV export
+st.subheader("Export calendar CSV (EST work blocks)")
+
+# We schedule only the "actionable" buckets by default
+sched_tasks = (do_now + stabilize + plan_next)
+
+blocks = availability_blocks(today_est(), days_ahead=21)
+events = schedule_into_blocks(sched_tasks, blocks)
+
+if not events:
+    st.write("No events to export yet (need open tasks).")
 else:
-    st.subheader("Do now")
-    if not do_now:
-        st.write("Nothing urgent + actionable right now.")
-    else:
-        for t in do_now[:6]:
-            render_task_row(t)
+    csv_cols = ["Subject", "Start Date", "Start Time", "End Date", "End Time", "All Day Event", "Description", "Location", "Private"]
+    # build CSV manually to avoid extra deps
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=csv_cols)
+    w.writeheader()
+    for e in events:
+        w.writerow(e)
+    csv_data = buf.getvalue().encode("utf-8")
 
-    st.subheader("Stabilize (urgent but not solvable fast)")
-    if not stabilize:
-        st.write("None.")
-    else:
-        for t in stabilize[:8]:
-            render_task_row(t)
-
-    st.subheader("Plan next")
-    if not plan_next:
-        st.write("None.")
-    else:
-        for t in plan_next[:10]:
-            st.write(f"- **[{t.category}] {t.title}**")
-
-    with st.expander("Parked (low priority noise)"):
-        if not park:
-            st.write("None.")
-        else:
-            for t in park[:20]:
-                st.write(f"- **[{t.category}] {t.title}**")
-
-
-with st.expander("Advanced: Export + Gemini key setup"):
-    st.write(f"Saved file: `{DATA_PATH.resolve()}`")
     st.download_button(
-        "Download tasks.json",
-        data=json.dumps({"tasks": [asdict(t) for t in tasks]}, indent=2),
-        file_name="tasks.json",
-        mime="application/json",
+        "Download Google Calendar CSV",
+        data=csv_data,
+        file_name=f"stress_triage_calendar_{today_est().isoformat()}.csv",
+        mime="text/csv",
         use_container_width=True,
     )
-    st.code(
-        """# Streamlit Cloud (recommended):
-# Settings -> Secrets
-# Add:
-# GEMINI_API_KEY="YOUR_KEY"
 
-# Local:
+    st.caption("Import in Google Calendar: Settings -> Import & export -> Import (choose this CSV). Make sure your calendar timezone is Eastern.")
+
+with st.expander("Setup: Gemini key"):
+    st.code(
+        """Streamlit Cloud:
+Settings -> Secrets:
+GEMINI_API_KEY="YOUR_KEY"
+
+Local:
 export GEMINI_API_KEY="YOUR_KEY"
 """,
         language="bash",
