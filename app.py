@@ -32,6 +32,24 @@ PLAN_PATH = APP_DIR / "today_plan.json"
 CATEGORIES = ["Money", "Family", "Nova", "School", "Health", "Admin", "Career", "Other"]
 BUCKETS = ["Do now", "Stabilize", "Plan next", "Park"]
 
+CATEGORY_COLORS = {
+    "Money": "#F59E0B",   # amber
+    "Family": "#EC4899",  # pink
+    "Nova": "#8B5CF6",    # violet
+    "School": "#10B981",  # emerald
+    "Health": "#EF4444",  # red
+    "Admin": "#6B7280",   # gray
+    "Career": "#0EA5E9",  # sky
+    "Other": "#64748B",   # slate
+}
+
+BUCKET_STYLES = {
+    "Do now":  {"bg": "#2563EB", "fg": "#FFFFFF"},  # blue
+    "Stabilize": {"bg": "#F97316", "fg": "#FFFFFF"},  # orange
+    "Plan next": {"bg": "#111827", "fg": "#FFFFFF"},  # dark
+    "Park": {"bg": "#9CA3AF", "fg": "#111827"},  # gray
+}
+
 
 @dataclass
 class Task:
@@ -66,6 +84,17 @@ def now_iso() -> str:
     return tz_now().isoformat(timespec="seconds")
 
 
+def format_due_short(due: Optional[str]) -> Optional[str]:
+    """Format YYYY-MM-DD -> 'Jan 29'."""
+    if not due:
+        return None
+    try:
+        d = date.fromisoformat(due)
+        return f"{d.strftime('%b')} {d.day}"
+    except Exception:
+        return None
+
+
 # -----------------------------
 # Storage helpers
 # -----------------------------
@@ -85,7 +114,6 @@ def load_tasks() -> List[Task]:
     for t in data.get("tasks", []):
         if not isinstance(t, dict):
             continue
-        # Backward compatible defaults
         t.setdefault("status", "Open")
         t.setdefault("snoozed_until", None)
         t.setdefault("blocked", False)
@@ -93,7 +121,6 @@ def load_tasks() -> List[Task]:
         try:
             tasks.append(Task(**t))
         except TypeError:
-            # If schema mismatch, skip the bad record
             continue
     return tasks
 
@@ -113,6 +140,12 @@ def load_plan() -> Optional[Dict[str, Any]]:
 
 def save_plan(plan: Dict[str, Any]) -> None:
     PLAN_PATH.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+
+def clear_all_saved() -> None:
+    save_tasks([])
+    if PLAN_PATH.exists():
+        PLAN_PATH.unlink()
 
 
 # -----------------------------
@@ -206,10 +239,10 @@ def next_step_template(category: str, text: str) -> str:
     t = text.lower()
     if category == "Money":
         if any(k in t for k in ["rent", "utilities", "bill", "due"]):
-            return "Send one message/call: confirm payment timing or ask for a short extension (10 min)."
-        return "Text the person: propose exact date plus partial payment if possible (10 min)."
+            return "Pay rent online."
+        return "Text the person: propose exact date plus partial payment if possible."
     if category == "Family":
-        return "Send boundary message: set 2 fixed call times this week, 20 min each (10 min)."
+        return "Send boundary message: set 2 fixed call times this week, 20 min each."
     if category == "Nova":
         return "2-min start: open the doc/list and outline. Then 45-min focused sprint."
     if category == "School":
@@ -247,9 +280,7 @@ def due_sort_key(t: Task) -> str:
 
 def compute_ranked(tasks: List[Task]) -> List[Task]:
     open_tasks = [t for t in tasks if t.status == "Open" and not is_snoozed(t)]
-    open_tasks.sort(
-        key=lambda t: (bucket_rank(t.bucket), -t.urgency, due_sort_key(t), t.created_at)
-    )
+    open_tasks.sort(key=lambda t: (bucket_rank(t.bucket), -t.urgency, due_sort_key(t), t.created_at))
     return open_tasks
 
 
@@ -312,7 +343,7 @@ Fields per object:
 - due_date: "YYYY-MM-DD" or null
 - urgency: integer 1-5 (5 = very urgent)
 - blocked: boolean
-- next_step: <= 15 minute action
+- next_step: a short actionable step
 
 Lines:
 {json.dumps(lines, ensure_ascii=False)}
@@ -332,20 +363,14 @@ Lines:
 
 
 # -----------------------------
-# Calendar scheduling + CSV export (priority based)
+# Calendar scheduling + CSV export
 # -----------------------------
 def availability_blocks(start_day: date, days_ahead: int = 21) -> List[Tuple[datetime, datetime]]:
-    """
-    Work windows in EST:
-    Mon-Fri: 7-9pm
-    Sat: 2-5pm
-    Sun: 7-9pm
-    """
     tz = ZoneInfo(TZ_NAME) if ZoneInfo else None
     blocks = []
     for i in range(days_ahead):
         d = start_day + timedelta(days=i)
-        dow = d.weekday()  # Mon=0 .. Sun=6
+        dow = d.weekday()
 
         if dow in [0, 1, 2, 3, 4]:  # Mon-Fri
             s, e = time(19, 0), time(21, 0)
@@ -360,7 +385,6 @@ def availability_blocks(start_day: date, days_ahead: int = 21) -> List[Tuple[dat
             start_dt = start_dt.replace(tzinfo=tz)
             end_dt = end_dt.replace(tzinfo=tz)
 
-        # If today, do not schedule in the past
         now_dt = tz_now()
         if start_dt < now_dt < end_dt:
             start_dt = now_dt.replace(second=0, microsecond=0)
@@ -381,10 +405,6 @@ def default_duration_minutes(task: Task) -> int:
 
 
 def schedule_into_blocks(tasks_in_order: List[Task], blocks: List[Tuple[datetime, datetime]]) -> List[Dict[str, Any]]:
-    """
-    Schedule tasks in priority order into available time blocks.
-    Splits tasks if needed.
-    """
     if not blocks:
         return []
 
@@ -449,11 +469,49 @@ def schedule_into_blocks(tasks_in_order: List[Task], blocks: List[Tuple[datetime
 
 
 # -----------------------------
-# UI
+# UI styling
 # -----------------------------
 st.set_page_config(page_title="Stress Triage", layout="wide")
 st.title("Stress Triage")
 st.caption("Paste tasks, click Triage. Today plan stays saved across restarts. Timezone: EST.")
+
+st.markdown(
+    """
+<style>
+.badge {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.task-title {
+  font-size: 18px;
+  font-weight: 650;
+  margin: 0;
+}
+.task-meta {
+  color: rgba(0,0,0,0.65);
+  font-size: 14px;
+  margin-top: 4px;
+}
+.task-box {
+  padding: 14px 14px 6px 14px;
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 14px;
+  margin-bottom: 14px;
+}
+.task-bullets ul {
+  margin-top: 8px;
+  margin-bottom: 10px;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 tasks = load_tasks()
 
@@ -468,13 +526,6 @@ right.divider()
 if right.button("Regenerate Today plan"):
     get_or_create_today_plan(tasks, force=True)
     st.success("Regenerated.")
-    st.rerun()
-
-if right.button("Clear all tasks"):
-    save_tasks([])
-    if PLAN_PATH.exists():
-        PLAN_PATH.unlink()
-    st.success("Cleared.")
     st.rerun()
 
 if not gemini_available():
@@ -569,39 +620,64 @@ planned_ids = {t.id for t in ordered}
 remaining = [t for t in compute_ranked(tasks) if t.id not in planned_ids]
 ordered.extend(remaining)
 
-# Buckets for display
 do_now = [t for t in ordered if t.bucket == "Do now"]
 stabilize = [t for t in ordered if t.bucket == "Stabilize"]
 plan_next = [t for t in ordered if t.bucket == "Plan next"]
 park = [t for t in ordered if t.bucket == "Park"]
 
-# Render function with Done + Delay
-def render_task(t: Task):
-    left, right = st.columns([6, 2])
-    with left:
-        due = f" | due {t.due_date}" if t.due_date else ""
-        snooze = f" | snoozed until {t.snoozed_until}" if t.snoozed_until else ""
-        st.write(f"**[{t.bucket}] [{t.category}] {t.title}** (urgency {t.urgency}/5{due}{snooze})")
-        st.write(f"- {t.next_step}")
 
-    with right:
-        if st.button("Done", key=f"done_{t.id}"):
+def badge_html(text: str, bg: str, fg: str) -> str:
+    return f'<span class="badge" style="background:{bg};color:{fg};">{text}</span>'
+
+
+def render_task(t: Task):
+    bstyle = BUCKET_STYLES.get(t.bucket, {"bg": "#111827", "fg": "#FFFFFF"})
+    cat_bg = CATEGORY_COLORS.get(t.category, "#64748B")
+    due_short = format_due_short(t.due_date)
+    due_str = f" | due {due_short}" if due_short else ""
+
+    # Task container
+    st.markdown('<div class="task-box">', unsafe_allow_html=True)
+
+    # Header line: Bucket badge + Category badge + Title + urgency + due
+    header = (
+        badge_html(t.bucket, bstyle["bg"], bstyle["fg"]) +
+        badge_html(t.category, cat_bg, "#FFFFFF") +
+        f'<span class="task-title">{t.title}</span>' +
+        f'<div class="task-meta">(urgency {t.urgency}/5{due_str})</div>'
+    )
+    st.markdown(header, unsafe_allow_html=True)
+
+    # Bullet list
+    st.markdown(
+        f'<div class="task-bullets"><ul><li>{st.session_state.get("escape", "")}{t.next_step}</li></ul></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Buttons row BELOW the bullets, aligned to the right (left-to-right order)
+    spacer, c_done, c_d1, c_d3 = st.columns([6, 1, 1, 1])
+    with c_done:
+        if st.button("Done", key=f"done_{t.id}", use_container_width=True):
             t.status = "Done"
             save_tasks(tasks)
             remove_from_plan(t.id)
             st.rerun()
 
-        if st.button("Delay (tomorrow)", key=f"delay1_{t.id}"):
+    with c_d1:
+        if st.button("Delay (tomorrow)", key=f"delay1_{t.id}", use_container_width=True):
             t.snoozed_until = (today_est() + timedelta(days=1)).isoformat()
             save_tasks(tasks)
             remove_from_plan(t.id)
             st.rerun()
 
-        if st.button("Delay (3 days)", key=f"delay3_{t.id}"):
+    with c_d3:
+        if st.button("Delay (3 days)", key=f"delay3_{t.id}", use_container_width=True):
             t.snoozed_until = (today_est() + timedelta(days=3)).isoformat()
             save_tasks(tasks)
             remove_from_plan(t.id)
             st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # Output
@@ -654,14 +730,27 @@ with st.expander("Snoozed"):
             with cols[0]:
                 st.write(f"**[{t.category}] {t.title}** (snoozed until {t.snoozed_until})")
             with cols[1]:
-                if st.button("Unsnooze", key=f"unsnooze_{t.id}"):
+                if st.button("Unsnooze", key=f"unsnooze_{t.id}", use_container_width=True):
                     t.snoozed_until = None
                     save_tasks(tasks)
                     st.rerun()
 
 st.divider()
 
-# Calendar CSV export, scheduled by priority and urgency
+# Button before CSV export (as requested)
+btn_row = st.columns([1.3, 1, 2.7])
+with btn_row[0]:
+    if st.button("Clear all saved tasks", use_container_width=True):
+        clear_all_saved()
+        st.success("Cleared all saved tasks.")
+        st.rerun()
+with btn_row[1]:
+    if st.button("Clear Today plan only", use_container_width=True):
+        if PLAN_PATH.exists():
+            PLAN_PATH.unlink()
+        st.success("Cleared Today plan.")
+        st.rerun()
+
 st.subheader("Export calendar CSV (scheduled by priority and urgency)")
 
 # Priority order for scheduling:
