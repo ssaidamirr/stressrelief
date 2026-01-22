@@ -5,99 +5,66 @@ import uuid
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Dict, Any
 
 import streamlit as st
 
-# Optional AI (Gemini)
+# Optional Gemini
 try:
     from google import genai
 except Exception:
-    genai = None  # app still works without AI
-
-from pydantic import BaseModel, Field, ValidationError
+    genai = None
 
 
 # -----------------------------
-# Storage
+# Storage (local file). Works on Streamlit Cloud too.
 # -----------------------------
-APP_DIR = Path.home() / ".stress_triage"
+APP_DIR = Path(".")  # keep inside app folder for Streamlit Cloud
 DATA_PATH = APP_DIR / "tasks.json"
 
-
 CATEGORIES = ["Money", "Family", "Nova", "School", "Health", "Admin", "Career", "Other"]
-STATUSES = ["Open", "Done", "Parked"]
+BUCKETS = ["Do now", "Stabilize", "Plan next", "Park"]
+STATUS = ["Open", "Done"]
 
 
 @dataclass
 class Task:
     id: str
+    raw: str
     title: str
     category: str
-    due_date: Optional[str]  # YYYY-MM-DD or None
-    importance: int          # 1-5
-    consequence: int         # 1-5
-    actionability: int       # 1-5
-    mental_load: int         # 1-5
-    effort: int              # 1-5
+    due_date: Optional[str]  # YYYY-MM-DD
+    urgency: int             # 1-5
     blocked: bool
-    next_step_15m: str
-    pinned: bool
+    next_step: str
+    bucket: str
     status: str
-    created_at: str          # ISO datetime
+    created_at: str
 
-    def due_as_date(self) -> Optional[date]:
-        if not self.due_date:
-            return None
-        try:
-            return date.fromisoformat(self.due_date)
-        except Exception:
-            return None
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def ensure_storage() -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_PATH.exists():
         DATA_PATH.write_text(json.dumps({"tasks": []}, indent=2), encoding="utf-8")
 
 
 def load_tasks() -> List[Task]:
     ensure_storage()
-    raw = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    tasks = []
-    for t in raw.get("tasks", []):
-        tasks.append(Task(**t))
-    return tasks
+    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    return [Task(**t) for t in data.get("tasks", [])]
 
 
 def save_tasks(tasks: List[Task]) -> None:
-    ensure_storage()
-    payload = {"tasks": [asdict(t) for t in tasks]}
-    DATA_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    DATA_PATH.write_text(json.dumps({"tasks": [asdict(t) for t in tasks]}, indent=2), encoding="utf-8")
 
 
 # -----------------------------
-# Helpers
+# Basic parsing (fallback if no Gemini)
 # -----------------------------
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def norm_1_5(v: int) -> float:
-    v = max(1, min(5, int(v)))
-    return (v - 1) / 4.0
-
-
-def parse_due_date_quick(text: str) -> Optional[str]:
-    """
-    Lightweight parser for:
-      - "due 2026-01-31"
-      - "due Jan 31"
-      - "tomorrow", "today"
-      - "in 3 days"
-      - "next week" -> +7 days
-    Returns YYYY-MM-DD or None
-    """
+def parse_due_date(text: str) -> Optional[str]:
     t = text.strip().lower()
     today = date.today()
 
@@ -105,36 +72,25 @@ def parse_due_date_quick(text: str) -> Optional[str]:
         return today.isoformat()
     if "tomorrow" in t:
         return (today + timedelta(days=1)).isoformat()
-    if "next week" in t:
-        return (today + timedelta(days=7)).isoformat()
 
     m = re.search(r"in\s+(\d{1,2})\s+days?", t)
     if m:
-        d = int(m.group(1))
-        return (today + timedelta(days=d)).isoformat()
+        return (today + timedelta(days=int(m.group(1)))).isoformat()
 
     m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", t)
     if m:
         return m.group(1)
 
-    # "due Jan 31" or "Jan 31"
-    month_map = {
-        "jan": 1, "january": 1,
-        "feb": 2, "february": 2,
-        "mar": 3, "march": 3,
-        "apr": 4, "april": 4,
-        "may": 5,
-        "jun": 6, "june": 6,
-        "jul": 7, "july": 7,
-        "aug": 8, "august": 8,
-        "sep": 9, "sept": 9, "september": 9,
-        "oct": 10, "october": 10,
-        "nov": 11, "november": 11,
-        "dec": 12, "december": 12,
+    # "Jan 29" or "due Jan 29"
+    month = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
+        "nov": 11, "november": 11, "dec": 12, "december": 12
     }
     m = re.search(r"\b(?:due\s+)?([a-z]{3,9})\s+(\d{1,2})(?:\b|,)\s*(\d{4})?\b", t)
     if m:
-        mon = month_map.get(m.group(1))
+        mon = month.get(m.group(1))
         day = int(m.group(2))
         yr = int(m.group(3)) if m.group(3) else today.year
         if mon:
@@ -146,606 +102,335 @@ def parse_due_date_quick(text: str) -> Optional[str]:
     return None
 
 
-def guess_category_basic(text: str) -> str:
+def guess_category(text: str) -> str:
     t = text.lower()
-    if any(k in t for k in ["rent", "bill", "payment", "bank", "money", "debt", "loan", "tuition"]):
+    if any(k in t for k in ["rent", "utility", "utilities", "bill", "owe", "payment", "pay", "$", "money", "tuition"]):
         return "Money"
-    if any(k in t for k in ["mom", "mother", "dad", "brother", "sister", "family"]):
+    if any(k in t for k in ["mom", "mother", "brother", "sister", "family", "dad"]):
         return "Family"
-    if any(k in t for k in ["nova", "client", "lead", "sales", "deliverable", "proposal"]):
+    if any(k in t for k in ["nova", "client", "students", "deliverable", "proposal", "follow up", "follow-up", "lead"]):
         return "Nova"
     if any(k in t for k in ["assignment", "exam", "class", "professor", "homework"]):
         return "School"
-    if any(k in t for k in ["doctor", "gym", "sleep", "health", "dentist"]):
+    if any(k in t for k in ["doctor", "sleep", "health", "dentist", "gym"]):
         return "Health"
-    if any(k in t for k in ["dmv", "form", "paperwork", "visa", "opt", "ssn", "admin"]):
+    if any(k in t for k in ["dmv", "paperwork", "form", "visa", "opt", "ssn", "admin"]):
         return "Admin"
     return "Other"
 
 
-def due_score(due: Optional[date]) -> float:
-    """
-    0..1, higher means more urgent based on due proximity.
-    """
-    if due is None:
-        return 0.2
-    today = date.today()
-    delta = (due - today).days
-    if delta <= 0:
-        return 1.0
-    if delta == 1:
-        return 0.95
-    if delta <= 3:
-        return 0.9
-    if delta <= 7:
-        return 0.8
-    if delta <= 14:
-        return 0.6
-    if delta <= 30:
-        return 0.4
-    return 0.2
+def default_urgency(category: str, due: Optional[str], text: str) -> int:
+    # Base urgency by category
+    base = {"Money": 5, "Nova": 5, "Family": 4, "School": 4, "Health": 3, "Admin": 3, "Career": 3, "Other": 2}.get(category, 2)
+
+    # If due date is soon, bump
+    if due:
+        try:
+            d = date.fromisoformat(due)
+            days = (d - date.today()).days
+            if days <= 0:
+                return 5
+            if days <= 3:
+                return max(base, 5)
+            if days <= 7:
+                return max(base, 4)
+        except Exception:
+            pass
+
+    # If contains "asap" or "urgent"
+    if re.search(r"\basap\b|\burgent\b|\bdue\b", text.lower()):
+        return min(5, max(base, 4))
+
+    return min(5, max(1, base))
 
 
-def compute_scores(task: Task, weights: Dict[str, float], thresholds: Dict[str, float]) -> Dict[str, float]:
-    """
-    Returns dict of scores:
-      - urgency (0..1)
-      - priority (0..1-ish)
-    """
-    cons = norm_1_5(task.consequence)
-    imp = norm_1_5(task.importance)
-    stress = norm_1_5(task.mental_load)
-    eff = norm_1_5(task.effort)
-
-    dscore = due_score(task.due_as_date())
-
-    urgency = (
-        weights["w_due"] * dscore +
-        weights["w_consequence"] * cons
-    )
-    urgency = max(0.0, min(1.0, urgency))
-
-    priority = (
-        weights["w_urgency"] * urgency +
-        weights["w_importance"] * imp +
-        weights["w_stress"] * stress -
-        weights["w_effort_penalty"] * eff
-    )
-
-    if task.pinned:
-        priority += thresholds["pin_boost"]
-
-    # Keep in a reasonable band
-    priority = max(0.0, min(1.2, priority))
-    return {"urgency": urgency, "priority": priority}
+def default_blocked(category: str, text: str) -> bool:
+    t = text.lower()
+    # money debts often not solvable instantly -> treat as "blocked" unless it's a direct bill with due date
+    if category == "Money" and any(k in t for k in ["owe", "pay back", "payback", "need to give", "need to pay"]):
+        return True
+    # family overwhelm -> not "blocked" but we want "container" actions, which behave like stabilize
+    if category == "Family" and any(k in t for k in ["mom", "mother"]):
+        return True
+    return False
 
 
-def classify_bucket(task: Task, urgency: float, thresholds: Dict[str, float]) -> str:
-    """
-    Buckets:
-      - Do now: urgent + actionable
-      - Stabilize: urgent + not actionable
-      - Plan next: important but not urgent
-      - Park: low value or noise
-    """
-    if task.status != "Open":
-        return task.status
+def next_step_template(category: str, text: str) -> str:
+    t = text.lower()
 
-    act = norm_1_5(task.actionability)
-    imp = norm_1_5(task.importance)
+    if category == "Money":
+        if any(k in t for k in ["rent", "utilities", "bill", "due"]):
+            return "Send one message/call to confirm payment timing or ask for a short extension (10 min)."
+        return "Text the person: propose a date + partial payment if possible (10 min)."
 
-    if urgency >= thresholds["urgent_cutoff"]:
-        if act >= thresholds["actionable_cutoff"]:
-            return "Do now"
-        return "Stabilize"
+    if category == "Family":
+        # container action
+        return "Send boundary message: set 2 fixed call times this week, 20 min each (10 min)."
 
-    if imp >= thresholds["important_cutoff"]:
+    if category == "Nova":
+        return "2-min start: open the doc/list, write the first ugly outline. Then 45-min focused sprint."
+
+    if category == "School":
+        return "Write the next 3 micro-steps and do the first 15 minutes immediately."
+
+    return "Write the smallest 15-min next action and do it now."
+
+
+def bucket_rule(category: str, urgency: int, blocked: bool) -> str:
+    # Simple + practical: urgent + actionable -> Do now, urgent + blocked -> Stabilize
+    if urgency >= 4:
+        return "Stabilize" if blocked else "Do now"
+    if urgency == 3:
         return "Plan next"
-
     return "Park"
 
 
-def template_next_steps(task: Task) -> List[str]:
-    """
-    Non-AI default suggestions for Stabilize and quick next steps.
-    """
-    title = task.title.strip()
-    cat = task.category
-
-    if cat == "Money":
-        return [
-            "List the next 14 days: balance, income dates, mandatory bills (10 min).",
-            "Send one extension/payment-plan message to whoever is due next (10 min).",
-            "Pause one subscription or non-essential spend today (5 min).",
-        ]
-
-    if cat == "Family":
-        return [
-            "Send a boundary message and propose fixed call windows (10 min).",
-            "Schedule 2 calls this week, 20 minutes each, and stick to it (5 min).",
-            "During calls, limit to 1 topic + end with 1 small next step (prep 3 min).",
-        ]
-
-    if cat == "Nova":
-        return [
-            "Define 'done' for this task in 3 bullets (5 min).",
-            "2-minute start: open the doc, write the first ugly version (2 min).",
-            "45-minute deep work sprint with phone away (set timer now).",
-        ]
-
-    return [
-        "Write the smallest next action that fits in 15 minutes.",
-        "Start with a 2-minute setup and then do 10 minutes focused work.",
-    ]
-
-
 # -----------------------------
-# Gemini (Optional)
+# Gemini integration (optional)
 # -----------------------------
-class TaskDraft(BaseModel):
-    title: str = Field(description="Short task title, clear and concrete.")
-    category: str = Field(description=f"One of: {', '.join(CATEGORIES)}")
-    due_date: Optional[str] = Field(description="YYYY-MM-DD if a due date is implied, else null.")
-    importance: int = Field(description="1-5. Goal relevance.")
-    consequence: int = Field(description="1-5. Real downside if ignored soon.")
-    actionability: int = Field(description="1-5. How easy to take a next step within 15 min.")
-    mental_load: int = Field(description="1-5. How much it loops in the head.")
-    effort: int = Field(description="1-5. How hard the overall task feels.")
-    blocked: bool = Field(description="True if it cannot be solved right now without external dependency.")
-    next_step_15m: str = Field(description="A specific next step that fits in 15 minutes or less.")
-
-
 def get_api_key() -> Optional[str]:
-    # Prefer Streamlit secrets, then env
+    # Streamlit Cloud: use secrets
+    key = None
     if "GEMINI_API_KEY" in st.secrets:
-        return str(st.secrets["GEMINI_API_KEY"]).strip() or None
-    if "GOOGLE_API_KEY" in st.secrets:
-        return str(st.secrets["GOOGLE_API_KEY"]).strip() or None
-    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip() or None
+        key = str(st.secrets["GEMINI_API_KEY"]).strip()
+    if not key:
+        key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    return key or None
 
 
-def ai_enabled() -> bool:
-    return (genai is not None) and (get_api_key() is not None)
+def gemini_available() -> bool:
+    return genai is not None and get_api_key() is not None
 
 
-def ai_parse_line(line: str, model: str) -> Optional[TaskDraft]:
+def gemini_triage(lines: List[str], model: str) -> Optional[List[Dict[str, Any]]]:
     """
-    Uses structured output to turn a messy line into a TaskDraft.
+    Returns a list of dicts:
+    {title, category, due_date, urgency, blocked, next_step}
     """
-    if not ai_enabled():
+    if not gemini_available():
         return None
 
+    client = genai.Client(api_key=get_api_key())
+
     prompt = f"""
-You are helping a user triage stress into action.
-Convert the input into a single task with realistic 1-5 scores.
+You are a stress triage assistant. Turn each line into a structured task.
 
-Rules:
-- Keep title short and actionable.
-- category must be one of: {CATEGORIES}
-- due_date must be YYYY-MM-DD or null.
-- next_step_15m must be very specific, doable in 15 minutes.
+Return ONLY valid JSON (no markdown), as an array of objects.
+Each object must include:
+- title: short concrete title
+- category: one of {CATEGORIES}
+- due_date: "YYYY-MM-DD" or null
+- urgency: integer 1-5 (5 = very urgent)
+- blocked: boolean (true if not solvable now; then suggest stabilize step)
+- next_step: a specific action that fits in <= 15 minutes
 
-Input:
-{line}
+Lines:
+{json.dumps(lines, ensure_ascii=False)}
 """.strip()
 
     try:
-        client = genai.Client(api_key=get_api_key())
-        response = client.models.generate_content(
+        resp = client.models.generate_content(
             model=model,
             contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": TaskDraft.model_json_schema(),
-            },
         )
-        draft = TaskDraft.model_validate_json(response.text)
-        # Normalize category if model returns something close
-        if draft.category not in CATEGORIES:
-            draft.category = "Other"
-        # Clamp ints
-        for k in ["importance", "consequence", "actionability", "mental_load", "effort"]:
-            v = getattr(draft, k)
-            setattr(draft, k, max(1, min(5, int(v))))
-        return draft
+        # Try to parse JSON from response text
+        text = resp.text.strip()
+        # Sometimes models include extra text; extract JSON array if needed
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1:
+            text = text[start : end + 1]
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return None
+        out = []
+        for obj in data:
+            if not isinstance(obj, dict):
+                continue
+            out.append(obj)
+        return out
     except Exception:
         return None
 
 
 # -----------------------------
-# Streamlit UI
+# Streamlit UI (minimal)
 # -----------------------------
 st.set_page_config(page_title="Stress Triage", layout="wide")
-
 st.title("Stress Triage")
-st.caption("Dump tasks. Apply your subjective rules consistently. Get a small, clear plan.")
+st.caption("Paste everything. Click triage. Get a clear plan.")
 
-if "tasks" not in st.session_state:
-    st.session_state.tasks = load_tasks()
+tasks: List[Task] = load_tasks()
 
-tasks: List[Task] = st.session_state.tasks
+col1, col2 = st.columns([2, 1])
+with col2:
+    panic_mode = st.toggle("Panic mode", value=True)
+    st.caption("Panic mode shows only the smallest plan.")
+    use_gemini = st.toggle("Use Gemini (auto)", value=True, disabled=not gemini_available())
+    model = st.selectbox("Model", ["gemini-2.0-flash", "gemini-2.5-flash"], index=0, disabled=not gemini_available())
+    if not gemini_available():
+        st.caption("Gemini off: set GEMINI_API_KEY in Streamlit secrets or env.")
 
-with st.sidebar:
-    st.header("Ranking rules (your call)")
-
-    st.subheader("Urgency components")
-    w_due = st.slider("Weight: due date proximity", 0.0, 1.0, 0.45, 0.05)
-    w_cons = st.slider("Weight: consequence severity", 0.0, 1.0, 0.55, 0.05)
-
-    # Normalize so they sum to 1 (avoid weird scaling)
-    s = max(1e-9, w_due + w_cons)
-    w_due /= s
-    w_cons /= s
-
-    st.subheader("Priority blend")
-    w_urgency = st.slider("Weight: urgency", 0.0, 1.0, 0.55, 0.05)
-    w_importance = st.slider("Weight: importance", 0.0, 1.0, 0.30, 0.05)
-    w_stress = st.slider("Weight: mental load", 0.0, 1.0, 0.15, 0.05)
-
-    st.subheader("Penalty and thresholds")
-    w_effort_penalty = st.slider("Effort penalty (optional)", 0.0, 0.30, 0.05, 0.01)
-
-    urgent_cutoff = st.slider("Urgent cutoff", 0.0, 1.0, 0.70, 0.05)
-    actionable_cutoff = st.slider("Actionable cutoff", 0.0, 1.0, 0.60, 0.05)
-    important_cutoff = st.slider("Important cutoff", 0.0, 1.0, 0.60, 0.05)
-    pin_boost = st.slider("Pinned boost", 0.0, 0.40, 0.15, 0.05)
-
-    weights = {
-        "w_due": w_due,
-        "w_consequence": w_cons,
-        "w_urgency": w_urgency,
-        "w_importance": w_importance,
-        "w_stress": w_stress,
-        "w_effort_penalty": w_effort_penalty,
-    }
-    thresholds = {
-        "urgent_cutoff": urgent_cutoff,
-        "actionable_cutoff": actionable_cutoff,
-        "important_cutoff": important_cutoff,
-        "pin_boost": pin_boost,
-    }
-
-    st.divider()
-    st.subheader("Gemini (optional)")
-
-    default_model = "gemini-3-flash-preview"
-    model = st.selectbox(
-        "Model",
-        options=[
-            "gemini-3-flash-preview",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-        ],
-        index=0,
+with col1:
+    st.subheader("Dump list")
+    dump = st.text_area(
+        "One per line",
+        height=160,
+        placeholder="Example:\n$1200 rent + utilities due Jan 29\nNeed to pay friend $1000 ASAP\nNova: finish 5 students applications\nCall mom (overwhelming)",
     )
+    cA, cB, cC = st.columns([1, 1, 1])
+    with cA:
+        triage_btn = st.button("Triage + add", use_container_width=True)
+    with cB:
+        clear_btn = st.button("Clear input", use_container_width=True)
+    with cC:
+        reset_btn = st.button("Clear all saved tasks", use_container_width=True)
 
-    st.write("AI status:", "Enabled" if ai_enabled() else "Off (no key or SDK missing)")
-    st.caption("Set GEMINI_API_KEY in environment or in .streamlit/secrets.toml")
-
-    panic_mode = st.toggle("Panic mode", value=False)
-    st.divider()
-
-    if st.button("Save to disk", use_container_width=True):
-        save_tasks(tasks)
-        st.success(f"Saved to {DATA_PATH}")
-
-    if st.button("Reload from disk", use_container_width=True):
-        st.session_state.tasks = load_tasks()
+    if clear_btn:
         st.rerun()
 
+    if reset_btn:
+        save_tasks([])
+        st.success("Cleared.")
+        st.rerun()
 
-def add_task_from_fields(
-    title: str,
-    category: str,
-    due_date: Optional[str],
-    importance: int,
-    consequence: int,
-    actionability: int,
-    mental_load: int,
-    effort: int,
-    blocked: bool,
-    next_step_15m: str,
-) -> None:
-    t = Task(
-        id=str(uuid.uuid4())[:8],
-        title=title.strip(),
-        category=category,
-        due_date=due_date,
-        importance=int(importance),
-        consequence=int(consequence),
-        actionability=int(actionability),
-        mental_load=int(mental_load),
-        effort=int(effort),
-        blocked=bool(blocked),
-        next_step_15m=next_step_15m.strip(),
-        pinned=False,
-        status="Open",
-        created_at=now_iso(),
-    )
-    st.session_state.tasks.insert(0, t)
+    if triage_btn:
+        lines = [ln.strip() for ln in dump.splitlines() if ln.strip()]
+        if not lines:
+            st.warning("Paste at least one line.")
+        else:
+            ai = gemini_triage(lines, model=model) if (use_gemini and gemini_available()) else None
 
+            for i, ln in enumerate(lines):
+                if ai and i < len(ai):
+                    obj = ai[i]
+                    title = str(obj.get("title") or ln).strip()
+                    category = str(obj.get("category") or guess_category(ln)).strip()
+                    if category not in CATEGORIES:
+                        category = guess_category(ln)
+                    due = obj.get("due_date")
+                    due = str(due).strip() if isinstance(due, str) and due.strip() else None
+                    urgency = int(obj.get("urgency") or 3)
+                    urgency = max(1, min(5, urgency))
+                    blocked = bool(obj.get("blocked")) if obj.get("blocked") is not None else default_blocked(category, ln)
+                    next_step = str(obj.get("next_step") or next_step_template(category, ln)).strip()
+                else:
+                    category = guess_category(ln)
+                    due = parse_due_date(ln)
+                    urgency = default_urgency(category, due, ln)
+                    blocked = default_blocked(category, ln)
+                    title = ln.strip()
+                    next_step = next_step_template(category, ln)
 
-def render_task_editor(t: Task) -> None:
-    cols = st.columns([2.6, 1.2, 1.2, 1.2, 1.2, 1.0])
-    with cols[0]:
-        t.title = st.text_input("Title", value=t.title, key=f"title_{t.id}")
-        t.next_step_15m = st.text_input("15-min next step", value=t.next_step_15m, key=f"ns_{t.id}")
+                bucket = bucket_rule(category, urgency, blocked)
 
-    with cols[1]:
-        t.category = st.selectbox("Category", CATEGORIES, index=CATEGORIES.index(t.category), key=f"cat_{t.id}")
-        t.status = st.selectbox("Status", STATUSES, index=STATUSES.index(t.status), key=f"st_{t.id}")
+                tasks.insert(
+                    0,
+                    Task(
+                        id=str(uuid.uuid4())[:8],
+                        raw=ln,
+                        title=title,
+                        category=category,
+                        due_date=due,
+                        urgency=urgency,
+                        blocked=blocked,
+                        next_step=next_step,
+                        bucket=bucket,
+                        status="Open",
+                        created_at=now_iso(),
+                    ),
+                )
 
-    with cols[2]:
-        due_str = t.due_date or ""
-        due_in = st.text_input("Due (YYYY-MM-DD)", value=due_str, key=f"due_{t.id}")
-        due_in = due_in.strip()
-        t.due_date = due_in if due_in else None
-        t.blocked = st.checkbox("Blocked now", value=t.blocked, key=f"blk_{t.id}")
-
-    with cols[3]:
-        t.importance = st.slider("Importance", 1, 5, int(t.importance), key=f"imp_{t.id}")
-        t.consequence = st.slider("Consequence", 1, 5, int(t.consequence), key=f"cons_{t.id}")
-
-    with cols[4]:
-        t.actionability = st.slider("Actionability", 1, 5, int(t.actionability), key=f"act_{t.id}")
-        t.mental_load = st.slider("Mental load", 1, 5, int(t.mental_load), key=f"ml_{t.id}")
-
-    with cols[5]:
-        t.effort = st.slider("Effort", 1, 5, int(t.effort), key=f"eff_{t.id}")
-        t.pinned = st.checkbox("Pin", value=t.pinned, key=f"pin_{t.id}")
-
-
-# -----------------------------
-# Views
-# -----------------------------
-tab_labels = ["Quick dump", "Triage", "Today", "Export"]
-tabs = st.tabs(tab_labels)
-
-# Quick dump
-with tabs[0]:
-    if panic_mode:
-        st.info("Panic mode is on. Go to the Today tab for the smallest plan.")
-    st.subheader("Quick dump")
-    st.write("Paste tasks/problems, one per line. Example: `Pay phone bill due Jan 28`")
-
-    use_ai = st.toggle("Use Gemini to clean and score lines (optional)", value=False, disabled=not ai_enabled())
-
-    dump = st.text_area("Tasks (one per line)", height=180, placeholder="One per line...")
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("Add lines", use_container_width=True):
-            lines = [ln.strip() for ln in dump.splitlines() if ln.strip()]
-            if not lines:
-                st.warning("Nothing to add.")
-            else:
-                added = 0
-                for ln in lines:
-                    draft = ai_parse_line(ln, model=model) if use_ai else None
-                    if draft:
-                        add_task_from_fields(
-                            title=draft.title,
-                            category=draft.category,
-                            due_date=draft.due_date,
-                            importance=draft.importance,
-                            consequence=draft.consequence,
-                            actionability=draft.actionability,
-                            mental_load=draft.mental_load,
-                            effort=draft.effort,
-                            blocked=draft.blocked,
-                            next_step_15m=draft.next_step_15m,
-                        )
-                        added += 1
-                    else:
-                        # Basic non-AI parse
-                        dd = parse_due_date_quick(ln)
-                        cat = guess_category_basic(ln)
-                        add_task_from_fields(
-                            title=ln,
-                            category=cat,
-                            due_date=dd,
-                            importance=3,
-                            consequence=3,
-                            actionability=3,
-                            mental_load=3,
-                            effort=3,
-                            blocked=False,
-                            next_step_15m="Write the smallest next step that takes 15 minutes.",
-                        )
-                        added += 1
-
-                st.success(f"Added {added} item(s).")
-                st.rerun()
-
-    with colB:
-        if st.button("Clear input box", use_container_width=True):
+            save_tasks(tasks)
+            st.success(f"Added {len(lines)} item(s). Go below for your plan.")
             st.rerun()
 
-    st.divider()
-    st.subheader("Add one item (manual)")
-    with st.form("manual_add", clear_on_submit=True):
-        title = st.text_input("Title", placeholder="Example: Call landlord about rent extension")
-        category = st.selectbox("Category", CATEGORIES, index=0)
-        due = st.text_input("Due date (optional, YYYY-MM-DD)")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            importance = st.slider("Importance", 1, 5, 3)
-        with c2:
-            consequence = st.slider("Consequence", 1, 5, 3)
-        with c3:
-            actionability = st.slider("Actionability", 1, 5, 3)
-        with c4:
-            mental_load = st.slider("Mental load", 1, 5, 3)
-        with c5:
-            effort = st.slider("Effort", 1, 5, 3)
 
-        blocked = st.checkbox("Blocked right now")
-        next_step = st.text_input("15-min next step", value="Write the smallest next step that takes 15 minutes.")
-        submit = st.form_submit_button("Add")
+# -----------------------------
+# Output
+# -----------------------------
+open_tasks = [t for t in tasks if t.status == "Open"]
 
-        if submit:
-            if not title.strip():
-                st.warning("Title is required.")
-            else:
-                add_task_from_fields(
-                    title=title,
-                    category=category,
-                    due_date=due.strip() or None,
-                    importance=importance,
-                    consequence=consequence,
-                    actionability=actionability,
-                    mental_load=mental_load,
-                    effort=effort,
-                    blocked=blocked,
-                    next_step_15m=next_step,
-                )
-                st.success("Added.")
-                st.rerun()
+# Sort: bucket first, urgency desc, created_at desc
+bucket_order = {"Do now": 0, "Stabilize": 1, "Plan next": 2, "Park": 3}
+open_tasks.sort(key=lambda t: (bucket_order.get(t.bucket, 9), -t.urgency, t.created_at), reverse=False)
+
+do_now = [t for t in open_tasks if t.bucket == "Do now"]
+stabilize = [t for t in open_tasks if t.bucket == "Stabilize"]
+plan_next = [t for t in open_tasks if t.bucket == "Plan next"]
+park = [t for t in open_tasks if t.bucket == "Park"]
 
 
-# Triage
-with tabs[1]:
-    st.subheader("Triage dashboard")
+def render_task_row(t: Task):
+    left, right = st.columns([6, 1])
+    with left:
+        due = f" | due {t.due_date}" if t.due_date else ""
+        st.write(f"**[{t.category}] {t.title}**  (urgency {t.urgency}/5{due})")
+        st.write(f"- {t.next_step}")
+    with right:
+        if st.button("Done", key=f"done_{t.id}"):
+            t.status = "Done"
+            save_tasks(tasks)
+            st.rerun()
 
-    open_tasks = [t for t in tasks if t.status == "Open"]
-    if not open_tasks:
-        st.info("No open tasks yet. Add some in Quick dump.")
+
+st.divider()
+
+if panic_mode:
+    st.subheader("Today (Top 3 only)")
+    top = (do_now + stabilize + plan_next)[:3]
+    if not top:
+        st.info("No open items. Add lines above.")
     else:
-        rows = []
-        for t in open_tasks:
-            scores = compute_scores(t, weights, thresholds)
-            bucket = classify_bucket(t, scores["urgency"], thresholds)
-            rows.append((t, scores["urgency"], scores["priority"], bucket))
+        for t in top:
+            render_task_row(t)
+else:
+    st.subheader("Do now")
+    if not do_now:
+        st.write("Nothing urgent + actionable right now.")
+    else:
+        for t in do_now[:6]:
+            render_task_row(t)
 
-        rows.sort(key=lambda x: x[2], reverse=True)
-
-        # Overview
-        bucket_counts = {}
-        for _, _, _, b in rows:
-            bucket_counts[b] = bucket_counts.get(b, 0) + 1
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Do now", bucket_counts.get("Do now", 0))
-        c2.metric("Stabilize", bucket_counts.get("Stabilize", 0))
-        c3.metric("Plan next", bucket_counts.get("Plan next", 0))
-        c4.metric("Park", bucket_counts.get("Park", 0))
-
-        st.divider()
-
-        for (t, urg, pri, bucket) in rows:
-            with st.expander(f"[{bucket}] {t.title}", expanded=False):
-                st.write(
-                    f"Urgency: **{urg:.2f}**  |  Priority: **{pri:.2f}**  |  Category: **{t.category}**"
-                )
-
-                # Explain why it ranks
-                dd = t.due_as_date()
-                dd_str = dd.isoformat() if dd else "None"
-                st.caption(
-                    f"Due: {dd_str}. Consequence: {t.consequence}/5. Importance: {t.importance}/5. "
-                    f"Actionability: {t.actionability}/5. Mental load: {t.mental_load}/5."
-                )
-
-                render_task_editor(t)
-
-                if bucket in ["Stabilize", "Do now"] and not t.next_step_15m.strip():
-                    st.write("Suggested defaults:")
-                    for s in template_next_steps(t):
-                        st.write("-", s)
-
-                if st.button("Delete", key=f"del_{t.id}"):
-                    st.session_state.tasks = [x for x in st.session_state.tasks if x.id != t.id]
-                    st.rerun()
-
-
-# Today
-with tabs[2]:
-    st.subheader("Today plan")
-
-    # Build ranked buckets
-    ranked = []
-    for t in tasks:
-        if t.status != "Open":
-            continue
-        scores = compute_scores(t, weights, thresholds)
-        bucket = classify_bucket(t, scores["urgency"], thresholds)
-        ranked.append((t, scores["urgency"], scores["priority"], bucket))
-
-    ranked.sort(key=lambda x: x[2], reverse=True)
-
-    do_now = [x for x in ranked if x[3] == "Do now"]
-    stabilize = [x for x in ranked if x[3] == "Stabilize"]
-    plan_next = [x for x in ranked if x[3] == "Plan next"]
-
-    if panic_mode:
-        st.info("Panic mode: you only see the smallest plan.")
-        st.write("### Top 3")
-        top3 = (do_now + stabilize + plan_next)[:3]
-        if not top3:
-            st.write("Nothing open. Add items first.")
-        for (t, urg, pri, bucket) in top3:
-            st.write(f"**[{bucket}] {t.title}**")
-            step = t.next_step_15m.strip() or template_next_steps(t)[0]
-            st.write("-", step)
-        st.stop()
-
-    st.write("### Top 3 to act on")
-    top3 = do_now[:3]
-    if not top3:
-        st.write("No 'Do now' tasks. That is fine.")
-    for (t, urg, pri, bucket) in top3:
-        st.write(f"**{t.title}**  (Priority {pri:.2f})")
-        st.write("-", t.next_step_15m.strip() or template_next_steps(t)[0])
-
-    st.divider()
-    st.write("### Stabilize (urgent but not solvable fast)")
+    st.subheader("Stabilize (urgent but not solvable fast)")
     if not stabilize:
-        st.write("None right now.")
+        st.write("None.")
     else:
-        for (t, urg, pri, bucket) in stabilize[:8]:
-            st.write(f"**{t.title}**  (Urgency {urg:.2f})")
-            suggestions = template_next_steps(t)
-            # Use either the saved next step or a stabilize suggestion
-            if t.next_step_15m.strip():
-                st.write("-", t.next_step_15m.strip())
-            else:
-                for s in suggestions[:3]:
-                    st.write("-", s)
+        for t in stabilize[:8]:
+            render_task_row(t)
 
-    st.divider()
-    st.write("### Plan next (important, not urgent)")
+    st.subheader("Plan next")
     if not plan_next:
-        st.write("None right now.")
+        st.write("None.")
     else:
-        for (t, urg, pri, bucket) in plan_next[:8]:
-            st.write(f"- {t.title}")
+        for t in plan_next[:10]:
+            st.write(f"- **[{t.category}] {t.title}**")
+
+    with st.expander("Parked (low priority noise)"):
+        if not park:
+            st.write("None.")
+        else:
+            for t in park[:20]:
+                st.write(f"- **[{t.category}] {t.title}**")
 
 
-# Export
-with tabs[3]:
-    st.subheader("Export / Backup")
-    st.write(f"Local file path: `{DATA_PATH}`")
-
-    export = {"tasks": [asdict(t) for t in tasks]}
+with st.expander("Advanced: Export + Gemini key setup"):
+    st.write(f"Saved file: `{DATA_PATH.resolve()}`")
     st.download_button(
         "Download tasks.json",
-        data=json.dumps(export, indent=2),
+        data=json.dumps({"tasks": [asdict(t) for t in tasks]}, indent=2),
         file_name="tasks.json",
         mime="application/json",
         use_container_width=True,
     )
-
-    st.divider()
-    st.subheader("Gemini key setup")
     st.code(
-        """# Option A: environment variable (recommended)
-export GEMINI_API_KEY="YOUR_KEY_HERE"
+        """# Streamlit Cloud (recommended):
+# Settings -> Secrets
+# Add:
+# GEMINI_API_KEY="YOUR_KEY"
 
-# Option B: Streamlit secrets
-# Create: .streamlit/secrets.toml
-GEMINI_API_KEY="YOUR_KEY_HERE"
+# Local:
+export GEMINI_API_KEY="YOUR_KEY"
 """,
         language="bash",
     )
